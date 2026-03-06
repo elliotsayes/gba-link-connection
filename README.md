@@ -46,21 +46,67 @@ _(click on the emojis for documentation)_
 
 ### Compiling the examples
 
-Running `./compile.sh` builds all the examples with the right configuration.
+Use the repo-level `./rom` runner to build one project, a group, or all projects.
 
 The project must be in a path without spaces; _devkitARM_ and some \*nix commands are required.
 
-All the projects understand these Makefile actions:
+List available targets:
+
+```bash
+./rom list
+```
+
+Build all examples as standalone cartridge ROMs:
+
+```bash
+./rom build examples
+```
+
+Build a single project:
+
+```bash
+./rom build examples/LinkCube_demo
+```
+
+Apply one-off flags to every selected project:
+
+```bash
+./rom build examples --userflags="-DMY_FLAG=1"
+```
+
+If a `scenarios/` folder exists, it is discovered automatically and can be built the same way:
+
+```bash
+./rom build scenarios
+```
+
+You can also target a nested directory prefix and it will build all discovered subprojects under it:
+
+```bash
+./rom build scenarios/LinkRawWireless
+```
+
+`./rom build` defaults to `--mode docker --kind standalone`. Override when needed, e.g. `--mode native` or `--kind multiboot`.
+
+For persistent directory-wide flags, set `group_defaults` in [`tools/rom.projects.json`](tools/rom.projects.json), for example:
+
+```json
+{
+  "group_defaults": {
+    "examples": { "userflags": "-DGLOBAL_FOR_EXAMPLES=1" },
+    "scenarios": {
+      "userflags": "-DSCENARIO_COMMON=1",
+      "standalone": { "userflags": "-DSCENARIO_CART=1" },
+      "multiboot": { "userflags": "-DSCENARIO_MB=1" }
+    }
+  }
+}
+```
+
+All leaf projects still use these Makefile actions internally:
 
 ```bash
 make [ clean | build | start | rebuild | restart ]
-```
-
-Alternatively, you can compile the examples using Docker:
-
-```bash
-cd examples
-./compile.sh docker
 ```
 
 ### C bindings

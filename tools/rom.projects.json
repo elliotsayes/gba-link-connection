@@ -1,0 +1,87 @@
+{
+  "docker_image": "devkitpro/devkitarm:20241104",
+  "dist_dir": "dist",
+  "roots": ["examples", "scenarios"],
+  "group_defaults": {},
+  "projects": {
+    "examples/LinkCard_demo": {
+      "artifact_template": "{target}{kind_suffix}.out.gba"
+    },
+    "examples/LinkCableMultiboot_demo": {
+      "artifact_template": "{target}{kind_suffix}.out.gba"
+    },
+    "examples/LinkWirelessMultiboot_demo": {
+      "artifact_template": "{target}{kind_suffix}.out.gba",
+      "standalone": {
+        "userflags": "-DLINK_WIRELESS_MULTIBOOT_ENABLE_LOGGING=1"
+      },
+      "multiboot": {
+        "userflags": "-DLINK_WIRELESS_MULTIBOOT_ENABLE_LOGGING=1"
+      }
+    },
+    "examples/LinkUniversal_basic": {
+      "standalone": {
+        "userflags": "-DLINK_WIRELESS_PUT_ISR_IN_IWRAM=1"
+      },
+      "multiboot": {
+        "userflags": "-DLINK_WIRELESS_PUT_ISR_IN_IWRAM=1"
+      }
+    },
+    "examples/LinkWireless_demo": {
+      "standalone": {
+        "userflags": "-DLINK_WIRELESS_PUT_ISR_IN_IWRAM=1"
+      },
+      "multiboot": {
+        "userflags": "-DLINK_WIRELESS_PUT_ISR_IN_IWRAM=1"
+      }
+    },
+    "examples/LinkUniversal_full": {
+      "virtual": true,
+      "build_dir": "examples/LinkCable_full",
+      "target": "LinkCable_full",
+      "artifact_name": "LinkUniversal_full",
+      "standalone": {
+        "userflags": "-DUSE_LINK_UNIVERSAL=1 -DLINK_WIRELESS_PUT_ISR_IN_IWRAM=1"
+      },
+      "multiboot": {
+        "userflags": "-DUSE_LINK_UNIVERSAL=1 -DLINK_WIRELESS_PUT_ISR_IN_IWRAM=1"
+      }
+    },
+    "examples/LinkUniversal_stress": {
+      "virtual": true,
+      "build_dir": "examples/LinkCable_stress",
+      "target": "LinkCable_stress",
+      "artifact_name": "LinkUniversal_stress",
+      "standalone": {
+        "userflags": "-DUSE_LINK_UNIVERSAL=1 -DLINK_WIRELESS_PUT_ISR_IN_IWRAM=1"
+      },
+      "multiboot": {
+        "userflags": "-DUSE_LINK_UNIVERSAL=1 -DLINK_WIRELESS_PUT_ISR_IN_IWRAM=1"
+      }
+    },
+    "examples/LinkWireless_prof_code_iwram": {
+      "virtual": true,
+      "build_dir": "examples/LinkWireless_demo",
+      "target": "LinkWireless_demo",
+      "artifact_name": "LinkWireless_prof_code_iwram",
+      "standalone": {
+        "userflags": "-DLINK_WIRELESS_PUT_ISR_IN_IWRAM=1 -DLINK_WIRELESS_PROFILING_ENABLED=1"
+      },
+      "multiboot": {
+        "userflags": "-DLINK_WIRELESS_PUT_ISR_IN_IWRAM=1 -DLINK_WIRELESS_PROFILING_ENABLED=1"
+      }
+    },
+    "examples/LinkWireless_prof_code_rom": {
+      "virtual": true,
+      "build_dir": "examples/LinkWireless_demo",
+      "target": "LinkWireless_demo",
+      "artifact_name": "LinkWireless_prof_code_rom",
+      "standalone": {
+        "userflags": "-DLINK_WIRELESS_PROFILING_ENABLED=1"
+      },
+      "multiboot": {
+        "userflags": "-DLINK_WIRELESS_PROFILING_ENABLED=1"
+      }
+    }
+  }
+}

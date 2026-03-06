@@ -1,0 +1,632 @@
+#!/usr/bin/env python3
+"""Build runner for GBA ROM projects in this repository."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import shlex
+import shutil
+import subprocess
+import sys
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Dict, Iterable, List, Sequence
+
+
+SCRIPT_PATH = Path(__file__).resolve()
+REPO_ROOT = SCRIPT_PATH.parent
+CONFIG_PATH = REPO_ROOT / "tools" / "rom.projects.json"
+DEFAULT_DOCKER_IMAGE = "devkitpro/devkitarm:20241104"
+DEFAULT_ROOTS = ("examples", "scenarios")
+DEFAULT_ARTIFACT_TEMPLATE = "{target}{kind_suffix}.gba"
+VALID_KINDS = ("standalone", "multiboot")
+
+
+@dataclass
+class KindOptions:
+    artifact_template: str | None = None
+    make_target: str | None = None
+    make_args: List[str] = field(default_factory=list)
+    userflags: str = ""
+
+
+@dataclass
+class GroupDefaults:
+    userflags: str = ""
+    kind_userflags: Dict[str, str] = field(default_factory=dict)
+
+
+@dataclass
+class Project:
+    project_id: str
+    group: str
+    name: str
+    build_dir: Path
+    target: str
+    artifact_name: str
+    artifact_template: str
+    make_target: str
+    make_args: List[str]
+    userflags: str
+    enabled: bool
+    virtual: bool
+    kind_options: Dict[str, KindOptions]
+
+    def rel_build_dir(self) -> Path:
+        return self.build_dir.relative_to(REPO_ROOT)
+
+    def options_for_kind(self, kind: str) -> KindOptions:
+        return self.kind_options.get(kind, KindOptions())
+
+
+class CliError(Exception):
+    pass
+
+
+def load_config() -> dict:
+    if not CONFIG_PATH.exists():
+        return {}
+
+    try:
+        with CONFIG_PATH.open("r", encoding="utf-8") as handle:
+            data = json.load(handle)
+    except json.JSONDecodeError as exc:
+        raise CliError(f"Invalid JSON in {CONFIG_PATH}: {exc}") from exc
+
+    if not isinstance(data, dict):
+        raise CliError(f"{CONFIG_PATH} must contain a JSON object at the top level.")
+    return data
+
+
+def parse_string_list(value: object, field_name: str, project_id: str) -> List[str]:
+    if value is None:
+        return []
+    if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
+        raise CliError(f"{field_name} for {project_id} must be a list of strings.")
+    return list(value)
+
+
+def parse_kind_options(kind_data: object, project_id: str, kind: str) -> KindOptions:
+    if kind_data is None:
+        return KindOptions()
+    if not isinstance(kind_data, dict):
+        raise CliError(f"{project_id}.{kind} must be a JSON object.")
+
+    artifact_template = kind_data.get("artifact_template")
+    if artifact_template is not None and not isinstance(artifact_template, str):
+        raise CliError(f"{project_id}.{kind}.artifact_template must be a string.")
+
+    make_target = kind_data.get("make_target")
+    if make_target is not None and not isinstance(make_target, str):
+        raise CliError(f"{project_id}.{kind}.make_target must be a string.")
+
+    make_args = parse_string_list(kind_data.get("make_args"), f"{project_id}.{kind}.make_args", project_id)
+
+    userflags = kind_data.get("userflags", "")
+    if not isinstance(userflags, str):
+        raise CliError(f"{project_id}.{kind}.userflags must be a string.")
+
+    return KindOptions(
+        artifact_template=artifact_template,
+        make_target=make_target,
+        make_args=make_args,
+        userflags=userflags,
+    )
+
+
+def discover_makefile_projects(roots: Sequence[str]) -> Dict[str, dict]:
+    discovered: Dict[str, dict] = {}
+    for root in roots:
+        root_path = REPO_ROOT / root
+        if not root_path.exists():
+            continue
+        if not root_path.is_dir():
+            raise CliError(f"Configured root '{root}' exists but is not a directory.")
+
+        for makefile in sorted(root_path.rglob("Makefile")):
+            project_dir = makefile.parent
+            rel_dir = project_dir.relative_to(root_path)
+            if any(part.startswith(".") or part.startswith("#") for part in rel_dir.parts):
+                continue
+            project_id = f"{root}/{rel_dir.as_posix()}"
+            discovered[project_id] = {
+                "build_dir": str(project_id),
+                "target": project_dir.name,
+                "artifact_name": project_dir.name,
+                "artifact_template": DEFAULT_ARTIFACT_TEMPLATE,
+                "make_target": "rebuild",
+                "make_args": [],
+                "userflags": "",
+                "enabled": True,
+                "virtual": False,
+            }
+    return discovered
+
+
+def merge_project_data(base: dict, override: dict, project_id: str) -> dict:
+    merged = dict(base)
+    merged.update(override)
+
+    valid_fields = {
+        "build_dir",
+        "target",
+        "artifact_name",
+        "artifact_template",
+        "make_target",
+        "make_args",
+        "userflags",
+        "enabled",
+        "virtual",
+        "standalone",
+        "multiboot",
+    }
+    unknown_fields = set(override) - valid_fields
+    if unknown_fields:
+        unknown_list = ", ".join(sorted(unknown_fields))
+        raise CliError(f"Unknown fields for project {project_id}: {unknown_list}")
+    return merged
+
+
+def project_from_data(project_id: str, data: dict) -> Project:
+    if "/" not in project_id:
+        raise CliError(f"Project id '{project_id}' must be in '<group>/<name>' format.")
+
+    group, default_name = project_id.split("/", 1)
+    build_dir_raw = data.get("build_dir", project_id)
+    if not isinstance(build_dir_raw, str):
+        raise CliError(f"build_dir for {project_id} must be a string.")
+
+    build_dir = (REPO_ROOT / build_dir_raw).resolve()
+    target = data.get("target", default_name)
+    artifact_name = data.get("artifact_name", default_name)
+    artifact_template = data.get("artifact_template", DEFAULT_ARTIFACT_TEMPLATE)
+    make_target = data.get("make_target", "rebuild")
+    make_args = parse_string_list(data.get("make_args"), "make_args", project_id)
+    userflags = data.get("userflags", "")
+    enabled = data.get("enabled", True)
+    virtual = data.get("virtual", False)
+
+    if not isinstance(target, str):
+        raise CliError(f"target for {project_id} must be a string.")
+    if not isinstance(artifact_name, str):
+        raise CliError(f"artifact_name for {project_id} must be a string.")
+    if not isinstance(artifact_template, str):
+        raise CliError(f"artifact_template for {project_id} must be a string.")
+    if not isinstance(make_target, str):
+        raise CliError(f"make_target for {project_id} must be a string.")
+    if not isinstance(userflags, str):
+        raise CliError(f"userflags for {project_id} must be a string.")
+    if not isinstance(enabled, bool):
+        raise CliError(f"enabled for {project_id} must be a boolean.")
+    if not isinstance(virtual, bool):
+        raise CliError(f"virtual for {project_id} must be a boolean.")
+
+    kind_options = {
+        "standalone": parse_kind_options(data.get("standalone"), project_id, "standalone"),
+        "multiboot": parse_kind_options(data.get("multiboot"), project_id, "multiboot"),
+    }
+
+    return Project(
+        project_id=project_id,
+        group=group,
+        name=default_name,
+        build_dir=build_dir,
+        target=target,
+        artifact_name=artifact_name,
+        artifact_template=artifact_template,
+        make_target=make_target,
+        make_args=make_args,
+        userflags=userflags,
+        enabled=enabled,
+        virtual=virtual,
+        kind_options=kind_options,
+    )
+
+
+def parse_group_defaults(config: dict) -> Dict[str, GroupDefaults]:
+    group_defaults_raw = config.get("group_defaults", {})
+    if not isinstance(group_defaults_raw, dict):
+        raise CliError("group_defaults must be an object keyed by group name.")
+
+    parsed: Dict[str, GroupDefaults] = {}
+    for group_name, group_data in group_defaults_raw.items():
+        if not isinstance(group_name, str):
+            raise CliError("group_defaults keys must be strings.")
+        if not isinstance(group_data, dict):
+            raise CliError(f"group_defaults.{group_name} must be an object.")
+
+        valid_fields = {"userflags", "standalone", "multiboot"}
+        unknown_fields = set(group_data) - valid_fields
+        if unknown_fields:
+            unknown_list = ", ".join(sorted(unknown_fields))
+            raise CliError(f"Unknown fields for group_defaults.{group_name}: {unknown_list}")
+
+        base_userflags = group_data.get("userflags", "")
+        if not isinstance(base_userflags, str):
+            raise CliError(f"group_defaults.{group_name}.userflags must be a string.")
+
+        kind_userflags: Dict[str, str] = {}
+        for kind in VALID_KINDS:
+            kind_entry = group_data.get(kind)
+            if kind_entry is None:
+                continue
+            if not isinstance(kind_entry, dict):
+                raise CliError(f"group_defaults.{group_name}.{kind} must be an object.")
+            unknown_kind_fields = set(kind_entry) - {"userflags"}
+            if unknown_kind_fields:
+                unknown_list = ", ".join(sorted(unknown_kind_fields))
+                raise CliError(f"Unknown fields for group_defaults.{group_name}.{kind}: {unknown_list}")
+            kind_flags = kind_entry.get("userflags", "")
+            if not isinstance(kind_flags, str):
+                raise CliError(f"group_defaults.{group_name}.{kind}.userflags must be a string.")
+            kind_userflags[kind] = kind_flags
+
+        parsed[group_name] = GroupDefaults(userflags=base_userflags, kind_userflags=kind_userflags)
+
+    return parsed
+
+
+def combine_userflags(*values: str) -> str:
+    return " ".join(value.strip() for value in values if value and value.strip())
+
+
+def load_projects() -> tuple[Dict[str, Project], str, Path, Dict[str, GroupDefaults]]:
+    config = load_config()
+
+    docker_image = config.get("docker_image", DEFAULT_DOCKER_IMAGE)
+    if not isinstance(docker_image, str):
+        raise CliError("docker_image must be a string.")
+
+    dist_dir_raw = config.get("dist_dir", "dist")
+    if not isinstance(dist_dir_raw, str):
+        raise CliError("dist_dir must be a string.")
+    dist_dir = (REPO_ROOT / dist_dir_raw).resolve()
+
+    configured_roots = config.get("roots", list(DEFAULT_ROOTS))
+    if not isinstance(configured_roots, list) or not all(isinstance(item, str) for item in configured_roots):
+        raise CliError("roots must be a list of directory strings.")
+
+    discovered_data = discover_makefile_projects(configured_roots)
+    group_defaults = parse_group_defaults(config)
+
+    project_overrides = config.get("projects", {})
+    if not isinstance(project_overrides, dict):
+        raise CliError("projects must be an object keyed by '<group>/<name>'.")
+
+    merged_data = dict(discovered_data)
+    for project_id, override in project_overrides.items():
+        if not isinstance(project_id, str):
+            raise CliError("Project keys under 'projects' must be strings.")
+        if not isinstance(override, dict):
+            raise CliError(f"Project override for {project_id} must be an object.")
+
+        base = merged_data.get(
+            project_id,
+            {
+                "build_dir": project_id,
+                "target": project_id.split("/", 1)[-1],
+                "artifact_name": project_id.split("/", 1)[-1],
+                "artifact_template": DEFAULT_ARTIFACT_TEMPLATE,
+                "make_target": "rebuild",
+                "make_args": [],
+                "userflags": "",
+                "enabled": True,
+                "virtual": True,
+            },
+        )
+        merged_data[project_id] = merge_project_data(base, override, project_id)
+
+    projects: Dict[str, Project] = {}
+    for project_id, data in merged_data.items():
+        project = project_from_data(project_id, data)
+        if not project.enabled:
+            continue
+        projects[project_id] = project
+
+    return projects, docker_image, dist_dir, group_defaults
+
+
+def build_indexes(projects: Dict[str, Project]) -> tuple[Dict[str, List[Project]], Dict[str, List[Project]]]:
+    by_group: Dict[str, List[Project]] = {}
+    by_name: Dict[str, List[Project]] = {}
+    for project in projects.values():
+        by_group.setdefault(project.group, []).append(project)
+        by_name.setdefault(project.name, []).append(project)
+
+    for values in by_group.values():
+        values.sort(key=lambda p: p.project_id)
+    for values in by_name.values():
+        values.sort(key=lambda p: p.project_id)
+    return by_group, by_name
+
+
+def select_projects(projects: Dict[str, Project], tokens: Sequence[str]) -> List[Project]:
+    by_group, by_name = build_indexes(projects)
+    ordered_all = sorted(projects.values(), key=lambda p: p.project_id)
+    known_groups = set(by_group) | set(DEFAULT_ROOTS)
+    selected: List[Project] = []
+    selected_ids = set()
+
+    def add(projects_to_add: Iterable[Project]) -> None:
+        for project in projects_to_add:
+            if project.project_id in selected_ids:
+                continue
+            selected.append(project)
+            selected_ids.add(project.project_id)
+
+    requested = list(tokens) if tokens else ["all"]
+    for raw_token in requested:
+        token = raw_token.strip().rstrip("/")
+        if not token:
+            continue
+
+        if token.startswith("./"):
+            token = token[2:]
+
+        if token == "all":
+            add(ordered_all)
+            continue
+
+        if token in by_group:
+            add(by_group[token])
+            continue
+
+        if token in projects:
+            add([projects[token]])
+            continue
+
+        prefix_matches = sorted(
+            (project for project_id, project in projects.items() if project_id.startswith(f"{token}/")),
+            key=lambda project: project.project_id,
+        )
+        if prefix_matches:
+            add(prefix_matches)
+            continue
+
+        if token in known_groups:
+            raise CliError(f"No projects found in group '{token}'.")
+
+        if token in by_name:
+            matches = by_name[token]
+            if len(matches) > 1:
+                options = ", ".join(item.project_id for item in matches)
+                raise CliError(f"Target '{raw_token}' is ambiguous. Use one of: {options}")
+            add(matches)
+            continue
+
+        raise CliError(f"Unknown target '{raw_token}'. Run './rom list' to see available targets.")
+
+    return selected
+
+
+def render_make_vars(
+    project: Project,
+    kind: str,
+    group_userflags: str = "",
+    cli_userflags: str = "",
+) -> tuple[List[str], str, str]:
+    kind_suffix = ".mb" if kind == "multiboot" else ""
+    options = project.options_for_kind(kind)
+    artifact_template = options.artifact_template or project.artifact_template
+    make_target = options.make_target or project.make_target
+
+    make_args: List[str] = [f"bMB={1 if kind == 'multiboot' else 0}"]
+    make_args.extend(project.make_args)
+    make_args.extend(options.make_args)
+
+    merged_userflags = combine_userflags(group_userflags, project.userflags, options.userflags, cli_userflags)
+    if merged_userflags:
+        make_args.append(f"USERFLAGS={merged_userflags}")
+
+    source_name = artifact_template.format(
+        target=project.target,
+        kind_suffix=kind_suffix,
+        artifact=project.artifact_name,
+        project=project.name,
+        kind=kind,
+    )
+    return make_args, make_target, source_name
+
+
+def run_make(
+    project: Project,
+    mode: str,
+    docker_image: str,
+    jobs: int | None,
+    make_target: str,
+    make_args: Sequence[str],
+    dry_run: bool,
+    verbose: bool,
+) -> None:
+    if not project.build_dir.exists():
+        raise CliError(f"Build directory does not exist for {project.project_id}: {project.build_dir}")
+    if not (project.build_dir / "Makefile").exists():
+        raise CliError(f"Missing Makefile for {project.project_id}: {project.build_dir / 'Makefile'}")
+
+    if mode == "native":
+        cmd = ["make"]
+        if jobs and jobs > 0:
+            cmd.append(f"-j{jobs}")
+        cmd.append(make_target)
+        cmd.extend(make_args)
+        cmd_cwd = project.build_dir
+    else:
+        rel_dir = project.rel_build_dir().as_posix()
+        make_cmd = ["make"]
+        if jobs and jobs > 0:
+            make_cmd.append(f"-j{jobs}")
+        make_cmd.append(make_target)
+        make_cmd.extend(make_args)
+        make_script = f"cd /opt/gba/{rel_dir} && " + " ".join(shlex.quote(arg) for arg in make_cmd)
+        cmd = [
+            "docker",
+            "run",
+            "--rm",
+            "--user",
+            f"{os.getuid()}:{os.getgid()}",
+            "-v",
+            f"{REPO_ROOT}:/opt/gba",
+            docker_image,
+            "bash",
+            "-lc",
+            make_script,
+        ]
+        cmd_cwd = REPO_ROOT
+
+    if verbose or dry_run:
+        prefix = "[dry-run] " if dry_run else ""
+        print(f"{prefix}{shlex.join(cmd)}")
+
+    if dry_run:
+        return
+
+    subprocess.run(cmd, cwd=cmd_cwd, check=True)
+
+
+def copy_artifact(project: Project, kind: str, source_name: str, dist_dir: Path, dry_run: bool) -> Path:
+    source = project.build_dir / source_name
+    project_id_parts = project.project_id.split("/")
+    relative_target_path = Path(*project_id_parts[1:]) if len(project_id_parts) > 1 else Path(project.project_id)
+    destination = (
+        dist_dir
+        / kind
+        / project.group
+        / relative_target_path.parent
+        / f"{project.artifact_name}.gba"
+    )
+
+    if dry_run:
+        return destination
+
+    if not source.exists():
+        raise CliError(
+            f"Expected output not found for {project.project_id}: {source}\n"
+            "If this project writes a non-standard artifact name, add an override in tools/rom.projects.json."
+        )
+
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(source, destination)
+    return destination
+
+
+def print_project_list(projects: Dict[str, Project]) -> None:
+    rows = sorted(projects.values(), key=lambda p: p.project_id)
+    for project in rows:
+        marker = " [virtual]" if project.virtual else ""
+        print(f"{project.project_id:35} -> {project.rel_build_dir().as_posix()}{marker}")
+
+
+def create_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="rom",
+        description="Build selected GBA projects from examples/ and scenarios/ with a consistent command.",
+    )
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    list_parser = subparsers.add_parser("list", help="List available project targets.")
+    list_parser.set_defaults(func=run_list)
+
+    build_parser = subparsers.add_parser("build", help="Build one, many, or all targets.")
+    build_parser.add_argument(
+        "targets",
+        nargs="*",
+        help="Targets like all, examples, scenarios/LinkRawWireless, examples/LinkCube_demo, or LinkCube_demo.",
+    )
+    build_parser.add_argument("--mode", choices=("native", "docker"), default="docker", help="Build backend.")
+    build_parser.add_argument(
+        "--kind",
+        choices=("standalone", "multiboot", "both"),
+        default="standalone",
+        help="ROM kind to build.",
+    )
+    build_parser.add_argument("--jobs", type=int, default=None, help="Parallel jobs passed to make (e.g. -j4).")
+    build_parser.add_argument(
+        "--userflags",
+        default="",
+        help="Extra USERFLAGS appended to every selected project for this run.",
+    )
+    build_parser.add_argument("--dry-run", action="store_true", help="Print commands without executing.")
+    build_parser.add_argument("--verbose", action="store_true", help="Print full command lines while executing.")
+    build_parser.set_defaults(func=run_build)
+    return parser
+
+
+def run_list(args: argparse.Namespace, projects: Dict[str, Project], *_: object) -> int:
+    print_project_list(projects)
+    return 0
+
+
+def run_build(
+    args: argparse.Namespace,
+    projects: Dict[str, Project],
+    docker_image: str,
+    dist_dir: Path,
+    group_defaults: Dict[str, GroupDefaults],
+) -> int:
+    selected = select_projects(projects, args.targets)
+    if not selected:
+        raise CliError("No projects selected.")
+
+    if args.kind == "both":
+        kinds = list(VALID_KINDS)
+    else:
+        kinds = [args.kind]
+
+    print(f"Selected {len(selected)} project(s): {', '.join(project.project_id for project in selected)}", flush=True)
+    print(f"Mode: {args.mode} | Kind: {', '.join(kinds)} | Docker image: {docker_image}", flush=True)
+
+    built_outputs: List[Path] = []
+    for kind in kinds:
+        for project in selected:
+            print(f"\n==> Building {project.project_id} [{kind}]", flush=True)
+            group_default = group_defaults.get(project.group, GroupDefaults())
+            group_userflags = combine_userflags(
+                group_default.userflags,
+                group_default.kind_userflags.get(kind, ""),
+            )
+            make_args, make_target, source_name = render_make_vars(
+                project,
+                kind,
+                group_userflags=group_userflags,
+                cli_userflags=args.userflags,
+            )
+            run_make(
+                project=project,
+                mode=args.mode,
+                docker_image=docker_image,
+                jobs=args.jobs,
+                make_target=make_target,
+                make_args=make_args,
+                dry_run=args.dry_run,
+                verbose=args.verbose,
+            )
+            destination = copy_artifact(project, kind, source_name, dist_dir, args.dry_run)
+            built_outputs.append(destination)
+            print(f"    output: {destination.relative_to(REPO_ROOT)}", flush=True)
+
+    if args.dry_run:
+        print("\nDry run complete.", flush=True)
+    else:
+        print(f"\nBuilt {len(built_outputs)} artifact(s).", flush=True)
+    return 0
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    parser = create_parser()
+    args = parser.parse_args(argv)
+
+    try:
+        projects, docker_image, dist_dir, group_defaults = load_projects()
+        return args.func(args, projects, docker_image, dist_dir, group_defaults)
+    except CliError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    except subprocess.CalledProcessError as exc:
+        print(f"error: command failed with exit code {exc.returncode}", file=sys.stderr)
+        return exc.returncode
+
+
+if __name__ == "__main__":
+    sys.exit(main())
